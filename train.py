@@ -25,9 +25,10 @@ import triton.language as tl
 from kernels import *
 from torch.distributed import ReduceOp
 from loss import autoencoder_loss
+from geom_median.torch import compute_geometric_median
+import json
 
 RANK = int(os.environ.get("RANK", "0"))
-
 
 ## parallelism
 
@@ -306,11 +307,11 @@ class FastAutoencoder(nn.Module):
         self.dead_steps_threshold = dead_steps_threshold
 
         self.group_dim = group_dim
-        self.d_model_full = d_model + group_dim 
+        self.d_model_full = d_model
         self.encoder = nn.Linear(self.d_model_full, n_dirs_local, bias=False)
         self.decoder = nn.Linear(n_dirs_local, d_model, bias=False)
 
-        self.pre_bias = nn.Parameter(torch.zeros(d_model))
+        self.pre_bias = nn.Parameter(torch.zeros(self.d_model))
         self.latent_bias = nn.Parameter(torch.zeros(n_dirs_local))
 
         self.stats_last_nonzero: torch.Tensor
@@ -338,89 +339,67 @@ class FastAutoencoder(nn.Module):
         return self.n_dirs_local * self.comms.n_op_shards
 
     def forward(self, x, group_vec):
-        x = torch.cat([x, group_vec], dim=-1)
+        x_full = torch.cat([x, group_vec], dim=-1)
+        pre_bias = self.comms.sh_allreduce_backward(self.pre_bias)
         class EncWrapper(torch.autograd.Function):
             @staticmethod
-            def forward(ctx, x, pre_bias, weight, latent_bias):
-                x = x - pre_bias
+            def forward(ctx, x, pre_bias, weight, latent_bias, d_model, n_dirs_local, stats_last_nonzero, auxk, auxk_mask_fn, sh_comm, group_dim):
+                weight = weight.to(x.dtype)
+                latent_bias = latent_bias.to(x.dtype)
+                x[:, :d_model - group_dim] -= pre_bias
                 latents_pre_act = F.linear(x, weight, latent_bias)
 
                 inds, vals = sharded_topk(
-                    latents_pre_act,
-                    k=self.k,
-                    sh_comm=self.comms.sh_comm,
-                    capacity_factor=4,
+                    latents_pre_act, k=self.k, sh_comm=sh_comm, capacity_factor=4
                 )
 
-                ## set num nonzero stat ##
-                tmp = torch.zeros_like(self.stats_last_nonzero)
-                tmp.scatter_add_(
-                    0,
-                    inds.reshape(-1),
-                    (vals > 1e-3).to(tmp.dtype).reshape(-1),
-                )
-                self.stats_last_nonzero *= 1 - tmp.clamp(max=1)
-                self.stats_last_nonzero += 1
-                ## end stats ##
+                tmp = torch.zeros_like(stats_last_nonzero)
+                tmp.scatter_add_(0, inds.reshape(-1), (vals > 1e-3).to(tmp.dtype).reshape(-1))
+                stats_last_nonzero *= 1 - tmp.clamp(max=1)
+                stats_last_nonzero += 1
 
-                ## auxk
-                if self.auxk is not None:  # for auxk
-                    # IMPORTANT: has to go after stats update!
-                    # WARN: auxk_mask_fn can mutate latents_pre_act!
+                if auxk is not None:
                     auxk_inds, auxk_vals = sharded_topk(
-                        self.auxk_mask_fn(latents_pre_act),
-                        k=self.auxk,
-                        sh_comm=self.comms.sh_comm,
-                        capacity_factor=2,
+                        auxk_mask_fn(latents_pre_act), k=auxk, sh_comm=sh_comm, capacity_factor=2
                     )
                     ctx.save_for_backward(x, weight, inds, auxk_inds)
                 else:
+                    auxk_inds, auxk_vals = None, None
                     ctx.save_for_backward(x, weight, inds)
-                    auxk_inds = None
-                    auxk_vals = None
 
-                ## end auxk
-
-                return (
-                    inds,
-                    vals,
-                    auxk_inds,
-                    auxk_vals,
-                )
+                ctx.d_model = d_model
+                ctx.n_dirs_local = n_dirs_local
+                ctx.auxk = auxk
+                return inds, vals, auxk_inds, auxk_vals
 
             @staticmethod
             def backward(ctx, _, grad_vals, __, grad_auxk_vals):
-                # encoder backwards
-                if self.auxk is not None:
+                if ctx.auxk is not None:
                     x, weight, inds, auxk_inds = ctx.saved_tensors
-
                     all_inds = torch.cat((inds, auxk_inds), dim=-1)
                     all_grad_vals = torch.cat((grad_vals, grad_auxk_vals), dim=-1)
                 else:
                     x, weight, inds = ctx.saved_tensors
-
                     all_inds = inds
                     all_grad_vals = grad_vals
 
-                grad_sum = torch.zeros(self.n_dirs_local, dtype=torch.float32, device=grad_vals.device)
-                grad_sum.scatter_add_(
-                    -1, all_inds.flatten(), all_grad_vals.flatten().to(torch.float32)
-                )
+                grad_sum = torch.zeros(ctx.n_dirs_local, dtype=torch.float32, device=grad_vals.device)
+                grad_sum.scatter_add_(-1, all_inds.flatten(), all_grad_vals.flatten().to(torch.float32))
 
                 return (
-                    None,
-                    # pre_bias grad optimization - can reduce before mat-vec multiply
-                    -(grad_sum @ weight),
-                    triton_sparse_transpose_dense_matmul(all_inds, all_grad_vals, x, N=self.n_dirs_local),
+                    None,  # x
+                    -grad_sum @ weight,  # pre_bias
+                    triton_sparse_transpose_dense_matmul(all_inds, all_grad_vals, x, N=ctx.n_dirs_local),
                     grad_sum,
+                    None, None, None, None, None, None  # for d_model, etc.
                 )
 
-        pre_bias = self.comms.sh_allreduce_backward(self.pre_bias)
-
-        # encoder
         inds, vals, auxk_inds, auxk_vals = EncWrapper.apply(
-            x, pre_bias, self.encoder.weight, self.latent_bias
+            x_full, pre_bias, self.encoder.weight, self.latent_bias,
+            self.d_model, self.n_dirs_local, self.stats_last_nonzero,
+            self.auxk, self.auxk_mask_fn, self.comms.sh_comm, self.group_dim
         )
+
 
         vals = torch.relu(vals)
         if auxk_vals is not None:
@@ -431,14 +410,17 @@ class FastAutoencoder(nn.Module):
         return recons, {
             "latents": vals,
             "auxk_inds": auxk_inds,
-            "auxk_vals": auxk_vals,
+             "auxk_vals": auxk_vals,
         }
+
+
 
     def decode_sparse(self, inds, vals):
         recons = TritonDecoderAutograd.apply(inds, vals, self.decoder.weight)
         recons = self.comms.sh_allreduce_forward(recons)
-
-        return recons + self.pre_bias
+        recons = recons.clone()
+        recons[:, :self.d_model - self.group_dim] += self.pre_bias
+        return recons
 
 def unit_norm_decoder_(autoencoder: FastAutoencoder) -> None:
     """
@@ -578,9 +560,11 @@ def training_loop_(
 
 
         with autocast_ctx_manager:
-            recons, info = ae(x_full)
+            recons, info = ae(x_tensor, group_vector)
 
-            loss = loss_fn(ae, x_full, recons, info, logger)
+            loss = loss_fn(ae, torch.cat([x_tensor, group_vector], dim=-1), recons, info, logger)
+
+
 
         print0(i, loss)
 
@@ -621,27 +605,29 @@ def training_loop_(
         logger.dumpkvs()
 
 
-def init_from_data_(ae, stats_acts_sample, comms):
+def init_from_data_(ae, stats_acts_sample, group_vector, comms):
     from geom_median.torch import compute_geometric_median
 
+    # 只用 activation 估计 pre_bias
     ae.pre_bias.data = (
         compute_geometric_median(stats_acts_sample[:32768].float().cpu()).median.cuda().float()
     )
     comms.all_broadcast(ae.pre_bias.data)
 
-    # encoder initialization (note: in our ablations we couldn't find clear evidence that this is beneficial, this is just to ensure exact match with internal codebase)
-    d_model = ae.d_model
     with torch.no_grad():
-        x = torch.randn(256, d_model).cuda().to(stats_acts_sample.dtype)
-        x /= x.norm(dim=-1, keepdim=True)
-        x += ae.pre_bias.data
-        comms.all_broadcast(x)
-        recons, _ = ae(x)
-        recons_norm = (recons - ae.pre_bias.data).norm(dim=-1).mean()
+        act_dim = ae.d_model - ae.group_dim
+        act_input = torch.randn(256, ae.d_model - ae.group_dim, device='cuda', dtype=stats_acts_sample.dtype)
+        act_input /= act_input.norm(dim=-1, keepdim=True)
+        act_input += ae.pre_bias.data
+
+        group_vec_sample = group_vector[:256].to(device=act_input.device, dtype=act_input.dtype)
+        recons, _ = ae(act_input, group_vec_sample)
+        recons_norm = (recons[:, :ae.d_model - ae.group_dim] - ae.pre_bias.data).norm(dim=-1).mean()
 
         ae.encoder.weight.data /= recons_norm.item()
-        print0("x norm", x.norm(dim=-1).mean().item())
-        print0("out norm", (ae(x)[0] - ae.pre_bias.data).norm(dim=-1).mean().item())
+
+        print0("x norm", act_input.norm(dim=-1).mean().item())
+        print0("out norm", (recons[:, :ae.d_model - ae.group_dim] - ae.pre_bias.data).norm(dim=-1).mean().item())
 
 
 from contextlib import contextmanager
@@ -716,17 +702,16 @@ def main():
     group_vector = torch.load("data/preprocessed/group_vectors.pt")  # [N, G]
     group_dim = group_vector.shape[1]              #  G
     group_label = torch.load("data/preprocessed/group_labels.pt")           # shape [N]
-    cfg.d_model = 768 + group_dim  # 自动加上 group 特征维度
-    comms = make_torch_comms(n_op_shards=cfg.n_op_shards, n_replicas=cfg.n_replicas)
-    
     x_tensor = torch.load("gemma_activations.pt")        # shape [N, 768]
+    cfg.d_model = x_tensor.shape[1] + group_vector.shape[1]
+    comms = make_torch_comms(n_op_shards=cfg.n_op_shards, n_replicas=cfg.n_replicas)
 
     x_full = torch.cat([x_tensor, group_vector], dim=-1)  # shape [N, 768 + group_dim]
     dataset = TensorDataset(x_full, group_label)
 
     bs_local = cfg.bs // cfg.n_replicas
     acts_iter = DataLoader(dataset, batch_size=bs_local, shuffle=True)
-    stats_acts_sample = x_full[:10000]  # 用前一万个样本估算 mean/std
+    stats_acts_sample = x_tensor[:10000]  # 用前一万个样本估算 mean/std
 
     n_dirs_local = cfg.n_dirs // cfg.n_op_shards
     bs_local = cfg.bs // cfg.n_replicas
@@ -734,19 +719,21 @@ def main():
     ae = FastAutoencoder(
         n_dirs_local=n_dirs_local,
         d_model=cfg.d_model,
+        group_dim=group_dim,
         k=cfg.k,
         auxk=cfg.auxk,
         dead_steps_threshold=cfg.dead_toks_threshold // cfg.bs,
         comms=comms,
     )
     ae.cuda()
-    init_from_data_(ae, stats_acts_sample, comms)
+    init_from_data_(ae, stats_acts_sample, group_vector, comms)
     # IMPORTANT: make sure all DP ranks have the same params
     comms.init_broadcast_(ae)
 
     mse_scale = (
         1 / ((stats_acts_sample.float().mean(dim=0) - stats_acts_sample.float()) ** 2).mean()
     )
+    mse_scale = mse_scale.to("cuda")
     comms.all_broadcast(mse_scale)
     mse_scale = mse_scale.item()
 
@@ -756,39 +743,29 @@ def main():
         dummy=cfg.wandb_project is None,
     )
 
-    training_loop_(
-        ae,
-        batch_tensors(
-            acts_iter,
-            bs_local,
-            drop_last=True,
-        ),
-        lambda ae, flat_acts_train_batch, recons, info, logger: (
-            # MSE
-            logger.logkv("train_recons", mse_scale * mse(recons, flat_acts_train_batch))
-            # AuxK
-            + logger.logkv(
-                "train_maxk_recons",
-                cfg.auxk_coef
-                * normalized_mse(
-                    ae.decode_sparse(
-                        info["auxk_inds"],
-                        info["auxk_vals"],
-                    ),
-                    flat_acts_train_batch - recons.detach() + ae.pre_bias.detach(),
-                ).nan_to_num(0),
-            )
-        ),
-        lr=cfg.lr,
-        eps=cfg.eps,
-        clip_grad=cfg.clip_grad,
-        ema_multiplier=cfg.ema_multiplier,
-        logger=logger,
-        comms=comms,
+    dataset = TensorDataset(x_tensor, group_vector, group_label)
+    batched_iter = DataLoader(dataset, batch_size=bs_local, shuffle=True, drop_last=True)
+
+    lambda ae, flat_acts_train_batch, recons, info, logger: (
+    logger.logkv("train_recons", mse_scale * mse(
+        recons, flat_acts_train_batch[:, :recons.shape[1]]
+    )) +
+    logger.logkv(
+        "train_maxk_recons",
+        cfg.auxk_coef
+        * normalized_mse(
+            ae.decode_sparse(info["auxk_inds"], info["auxk_vals"]),
+            flat_acts_train_batch[:, :x_tensor.shape[1]] - recons[:, :x_tensor.shape[1]].detach() + ae.pre_bias[:x_tensor.shape[1]].detach()
+        ).nan_to_num(0),
     )
+)
+
+    if RANK == 0:
+        with open("checkpoints/config.json", "w") as f:
+            json.dump(cfg.__dict__, f)
+        torch.save(ae.state_dict(), "checkpoints/autoencoder.pt")
 
 
 if __name__ == "__main__":
     main()
-
-
+    
